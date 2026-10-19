@@ -41,7 +41,7 @@ interface Shown {
 }
 
 type Plan =
-  | { action: 'post'; text: string }
+  | { action: 'post'; text: string; fromTemplate?: boolean }
   | { action: 'reply'; target: Post; text: string }
   | { action: 'quote'; target: Post; text: string }
   | { action: 'like'; target: Post }
@@ -382,7 +382,7 @@ class Simulator {
     if (res.kind === 'refusal') {
       log(a, `model refused (category ${res.category ?? 'none'}); falling back to a template post`);
       bump('llm_refusal_fallback');
-      return { action: 'post', text: this.writer.post(a.persona) };
+      return { action: 'post', text: this.writer.post(a.persona), fromTemplate: true };
     }
     if (res.kind !== 'ok') return null;
 
@@ -549,7 +549,7 @@ class Simulator {
     let via = 'tpl';
     if (this.llm?.enabled) {
       plan = await this.llmPlan(a, o);
-      if (plan) via = 'llm';
+      if (plan) via = plan.action === 'post' && plan.fromTemplate ? 'tpl' : 'llm';
     }
     plan ??= this.templatePlan(a, o);
     if (this.signal.aborted) return;

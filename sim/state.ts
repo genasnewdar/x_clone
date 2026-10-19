@@ -57,7 +57,8 @@ export class StateStore {
 
   save() {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.${process.pid}.tmp`;
+    // Named to match the .gitignore pattern sim/.agents*.json even if a crash leaves it behind.
+    const tmp = path.join(path.dirname(this.file), `.agents.tmp-${process.pid}.json`);
     fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', { mode: 0o600 });
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, this.file);
