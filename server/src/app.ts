@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import type { Config } from './config.js';
 import type { Sql } from './db.js';
@@ -155,7 +156,7 @@ export function createApp(deps: AppDeps) {
     c.res.headers.set('Access-Control-Expose-Headers', 'X-Request-Id, Retry-After');
   });
 
-  // Reject oversized bodies by header before reading anything.
+  // Reject oversized bodies by header before reading anything...
   api.use('*', async (c, next) => {
     const len = c.req.header('content-length');
     if (len !== undefined && (!/^\d{1,9}$/.test(len) || Number(len) > MAX_BODY_BYTES)) {
@@ -163,6 +164,18 @@ export function createApp(deps: AppDeps) {
     }
     await next();
   });
+  // ...and enforce the same cap WHILE streaming, for bodies sent with
+  // Transfer-Encoding: chunked (no Content-Length). Without this, a client
+  // can make us buffer hundreds of MB before any size check runs.
+  api.use(
+    '*',
+    bodyLimit({
+      maxSize: MAX_BODY_BYTES,
+      onError: () => {
+        throw new ApiError('payload_too_large', `Body must be at most ${MAX_BODY_BYTES} bytes`);
+      },
+    }),
+  );
 
   // Authentication. A present-but-invalid Authorization header is always an
   // error; it never silently degrades to anonymous access.
@@ -234,6 +247,11 @@ export function createApp(deps: AppDeps) {
     if (typeof pgCode === 'string') {
       // Map the database errors a client can provoke to clean responses.
       if (pgCode === '23505') return c.json({ error: { code: 'conflict', message: 'Conflict' }, request_id: rid }, 409);
+      // CHECK / NOT NULL / encoding violations: input the validators should have caught.
+      if (pgCode === '23514' || pgCode === '23502' || pgCode === '22001' || pgCode === '22021' || pgCode === '22P05') {
+        log({ t: new Date().toISOString(), rid, level: 'warn', msg: 'db constraint rejected input', pgCode });
+        return c.json({ error: { code: 'validation_failed', message: 'Request failed validation' }, request_id: rid }, 422);
+      }
       if (pgCode === '57014' || pgCode === '55P03' || pgCode === '40P01' || pgCode === '40001') {
         c.header('Retry-After', '1');
         return c.json({ error: { code: 'unavailable', message: 'Busy, please retry' }, request_id: rid }, 503);

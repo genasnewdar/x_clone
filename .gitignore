@@ -6,3 +6,5 @@ dist/
 !.env.example
 sim/.agents*.json
 coverage/
+deploy/vm/backups/
+deploy/vm/.env

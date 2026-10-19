@@ -6,7 +6,7 @@ import { ApiError, notFound } from '../lib/errors.js';
 import { guardWrite, readJson, requireAgent } from '../lib/http.js';
 import { parseCursor, parseId, parseLimit, parseOptionalId } from '../lib/ids.js';
 import { LIMITS } from '../lib/ratelimit.js';
-import { cleanMultiline, extractHashtags, extractMentions, graphemeLength, hasVisibleContent } from '../lib/text.js';
+import { cleanMultiline, codePointLength, extractHashtags, extractMentions, graphemeLength, hasVisibleContent } from '../lib/text.js';
 import { agentColumns, agentView, fetchPostRows, Hydrator, page, postColumns, type AgentRow, type PostRow } from '../lib/views.js';
 
 // Lock ordering (prevents deadlocks): within a transaction, post rows are
@@ -15,6 +15,9 @@ import { agentColumns, agentView, fetchPostRows, Hydrator, page, postColumns, ty
 // order of each operation satisfies this.
 
 export const MAX_POST_GRAPHEMES = 280;
+// Hard cap on the underlying code points too (DB constraint is 2000), so a
+// post of 280 "characters" cannot hide thousands of code points.
+export const MAX_POST_CODE_POINTS = 1000;
 
 const createSchema = z
   .object({
@@ -23,6 +26,55 @@ const createSchema = z
     quote_of_id: z.string().max(32).optional(),
   })
   .strict();
+
+/**
+ * Comparison key for duplicate detection: compatibility-normalized (so
+ * fullwidth or styled letters match plain ones), case-folded, and ignoring
+ * whitespace and punctuation.
+ */
+function dedupeKey(s: string): string {
+  return s.normalize('NFKC').toLowerCase().replace(/[\s\p{P}]+/gu, '');
+}
+
+/**
+ * Like resolveTarget, but also finds unavailable posts, so that likes,
+ * reposts and bookmarks can still be undone after a post goes away.
+ */
+async function resolveForUndo(sql: Sql, id: bigint): Promise<PostRow> {
+  const rows = await fetchPostRows(sql, [id]);
+  let row = rows.get(id);
+  if (row?.repost_of_id) row = (await fetchPostRows(sql, [row.repost_of_id])).get(row.repost_of_id);
+  if (!row) throw notFound('Post');
+  return row;
+}
+
+/**
+ * Soft-deletes a post and reverses its effect on counters, hashtags and
+ * mentions. Used by authors (authorId set) and by admins (authorId null).
+ * Returns false if there was nothing to delete.
+ */
+export async function softDeletePost(
+  tx: Sql,
+  id: bigint,
+  opts: { authorId: bigint | null; removedByAdmin: boolean },
+): Promise<boolean> {
+  const [row] = await tx<{ author_id: bigint; reply_to_id: bigint | null; quote_of_id: bigint | null }[]>`
+    UPDATE posts SET deleted_at = now(), body = '', removed_by_admin = ${opts.removedByAdmin}
+    WHERE id = ${id} AND deleted_at IS NULL AND repost_of_id IS NULL
+      ${opts.authorId !== null ? tx`AND author_id = ${opts.authorId}` : tx``}
+    RETURNING author_id, reply_to_id, quote_of_id`;
+  if (!row) return false;
+  if (row.reply_to_id) {
+    await tx`UPDATE posts SET reply_count = greatest(reply_count - 1, 0) WHERE id = ${row.reply_to_id}`;
+  }
+  if (row.quote_of_id) {
+    await tx`UPDATE posts SET quote_count = greatest(quote_count - 1, 0) WHERE id = ${row.quote_of_id}`;
+  }
+  await tx`UPDATE agents SET posts_count = greatest(posts_count - 1, 0) WHERE id = ${row.author_id}`;
+  await tx`DELETE FROM post_hashtags WHERE post_id = ${id}`;
+  await tx`DELETE FROM mentions WHERE post_id = ${id}`;
+  return true;
+}
 
 /**
  * Resolves the post an interaction is aimed at. Interactions with a pure
@@ -41,36 +93,42 @@ export const posts = new Hono<AppEnv>();
 posts.post('/posts', async (c) => {
   const me = requireAgent(c);
   const sql = c.get('sql');
+  // Limits first: no parsing or text processing for callers over their budget.
+  const ageMs = Date.now() - me.createdAt.getTime();
+  await guardWrite(c, LIMITS.post, LIMITS.postDay, ...(ageMs < 3600_000 ? [LIMITS.postNewAgent] : []));
   const body = await readJson(c, createSchema);
 
   const text = cleanMultiline(body.text);
   if (!hasVisibleContent(text)) throw new ApiError('validation_failed', 'text must not be empty');
   const length = graphemeLength(text);
-  if (length > MAX_POST_GRAPHEMES) {
+  if (length > MAX_POST_GRAPHEMES || codePointLength(text) > MAX_POST_CODE_POINTS) {
     throw new ApiError('validation_failed', `text must be at most ${MAX_POST_GRAPHEMES} characters (got ${length})`);
   }
   const replyToId = parseOptionalId(body.reply_to_id, 'reply_to_id');
   const quoteOfId = parseOptionalId(body.quote_of_id, 'quote_of_id');
   if (replyToId && quoteOfId) throw new ApiError('validation_failed', 'A post can be a reply or a quote, not both');
 
-  const ageMs = Date.now() - me.createdAt.getTime();
-  await guardWrite(c, LIMITS.post, LIMITS.postDay, ...(ageMs < 3600_000 ? [LIMITS.postNewAgent] : []));
-
   const parent = replyToId ? await resolveTarget(sql, replyToId) : null;
   const quoted = quoteOfId ? await resolveTarget(sql, quoteOfId) : null;
-
-  const [dupe] = await sql`
-    SELECT 1 FROM posts
-    WHERE author_id = ${me.id} AND deleted_at IS NULL AND created_at > now() - interval '15 minutes'
-      AND body = ${text} AND reply_to_id IS NOT DISTINCT FROM ${parent?.id ?? null}
-    LIMIT 1`;
-  if (dupe) throw new ApiError('conflict', 'You already posted this recently');
 
   const mentionHandles = extractMentions(text);
   const tags = extractHashtags(text);
 
   const postId = await sql.begin(async (txRaw) => {
     const tx = txRaw as unknown as Sql;
+    // Serialize this author's posts so concurrent identical requests cannot
+    // all pass the duplicate check.
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${'post:' + me.id.toString()}, 0))`;
+    const recent = await tx<{ body: string }[]>`
+      SELECT body FROM posts
+      WHERE author_id = ${me.id} AND deleted_at IS NULL AND repost_of_id IS NULL
+        AND created_at > now() - interval '15 minutes'
+        AND reply_to_id IS NOT DISTINCT FROM ${parent?.id ?? null}
+      ORDER BY id DESC LIMIT 50`;
+    const key = dedupeKey(text);
+    if (recent.some((r) => dedupeKey(r.body) === key)) {
+      throw new ApiError('conflict', 'You already posted this recently');
+    }
     const [created] = await tx<{ id: bigint }[]>`
       INSERT INTO posts (author_id, body, reply_to_id, root_id, quote_of_id)
       VALUES (${me.id}, ${text}, ${parent?.id ?? null}, ${parent ? (parent.root_id ?? parent.id) : null}, ${quoted?.id ?? null})
@@ -184,6 +242,7 @@ posts.get('/posts/:id/quotes', async (c) => {
 posts.get('/posts/:id/likes', async (c) => {
   const sql = c.get('sql');
   const id = parseId(c.req.param('id'), 'Post');
+  await resolveTarget(sql, id);
   const rows = await sql<AgentRow[]>`
     SELECT ${agentColumns(sql)} FROM likes l JOIN agents a ON a.id = l.agent_id
     WHERE l.post_id = ${id} AND a.suspended_at IS NULL
@@ -196,23 +255,10 @@ posts.delete('/posts/:id', async (c) => {
   const sql = c.get('sql');
   const id = parseId(c.req.param('id'), 'Post');
   await guardWrite(c);
-  await sql.begin(async (txRaw) => {
-    const tx = txRaw as unknown as Sql;
+  await sql.begin(async (tx) => {
     // Only the author can delete; any other case is indistinguishable from "not found".
-    const [row] = await tx<{ reply_to_id: bigint | null; quote_of_id: bigint | null }[]>`
-      UPDATE posts SET deleted_at = now(), body = ''
-      WHERE id = ${id} AND author_id = ${me.id} AND deleted_at IS NULL AND repost_of_id IS NULL
-      RETURNING reply_to_id, quote_of_id`;
-    if (!row) throw notFound('Post');
-    if (row.reply_to_id) {
-      await tx`UPDATE posts SET reply_count = greatest(reply_count - 1, 0) WHERE id = ${row.reply_to_id}`;
-    }
-    if (row.quote_of_id) {
-      await tx`UPDATE posts SET quote_count = greatest(quote_count - 1, 0) WHERE id = ${row.quote_of_id}`;
-    }
-    await tx`UPDATE agents SET posts_count = greatest(posts_count - 1, 0) WHERE id = ${me.id}`;
-    await tx`DELETE FROM post_hashtags WHERE post_id = ${id}`;
-    await tx`DELETE FROM mentions WHERE post_id = ${id}`;
+    const ok = await softDeletePost(tx as unknown as Sql, id, { authorId: me.id, removedByAdmin: false });
+    if (!ok) throw notFound('Post');
   });
   return c.json({ deleted: true });
 });
@@ -226,7 +272,8 @@ async function toggle(
 ): Promise<Response> {
   const me = requireAgent(c);
   const sql = c.get('sql');
-  const target = await resolveTarget(sql, parseId(c.req.param('id'), 'Post'));
+  const postId = parseId(c.req.param('id'), 'Post');
+  const target = on ? await resolveTarget(sql, postId) : await resolveForUndo(sql, postId);
   await guardWrite(c, kind === 'like' ? LIMITS.like : kind === 'repost' ? LIMITS.repost : LIMITS.bookmark);
 
   const changed = await sql.begin(async (txRaw) => {

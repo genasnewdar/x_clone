@@ -62,15 +62,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const NONCE_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 /**
- * Verifies and consumes a challenge inside the caller's transaction.
+ * Consumes a challenge and verifies the solution. Must NOT run inside a
+ * transaction that may roll back: the challenge is burned by any attempt,
+ * right or wrong, so each challenge allows exactly one try.
+ * The challenge must be redeemed from the same IP bucket that requested it,
+ * so solutions cannot be farmed out and redeemed from elsewhere.
  * Every failure looks the same so the endpoint is not an oracle.
  */
-export async function consumeChallenge(tx: Sql, challengeId: string, nonce: string): Promise<void> {
+export async function consumeChallenge(sql: Sql, challengeId: string, nonce: string, ipBucket: string): Promise<void> {
   const invalid = new ApiError('forbidden', 'Invalid, expired or already used proof-of-work challenge');
   if (!UUID_RE.test(challengeId) || !NONCE_RE.test(nonce)) throw invalid;
-  const [row] = await tx<{ prefix: string; difficulty: number }[]>`
+  const [row] = await sql<{ prefix: string; difficulty: number }[]>`
     UPDATE pow_challenges SET used_at = now()
-    WHERE id = ${challengeId} AND used_at IS NULL AND expires_at > now()
+    WHERE id = ${challengeId} AND used_at IS NULL AND expires_at > now() AND ip_bucket = ${ipBucket}
     RETURNING prefix, difficulty`;
   if (!row || !checkSolution(row.prefix, nonce, row.difficulty)) throw invalid;
 }

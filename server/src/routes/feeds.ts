@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../app.js';
+import type { Sql } from '../db.js';
 import { ApiError } from '../lib/errors.js';
 import { requireAgent } from '../lib/http.js';
 import { parseCursor, parseLimit } from '../lib/ids.js';
-import { LocalLimiter } from '../lib/ratelimit.js';
+import { hit, LIMITS, LocalLimiter } from '../lib/ratelimit.js';
 import { cleanSingleLine, escapeLike, normalizeTag } from '../lib/text.js';
 import { agentColumns, agentView, Hydrator, page, postColumns, type AgentRow, type PostRow } from '../lib/views.js';
 import { findAgentByHandle } from './agents.js';
@@ -109,9 +110,11 @@ feeds.get('/bookmarks', async (c) => {
 // Per-instance limiter: search is the most expensive read we have.
 const searchLimiter = new LocalLimiter(30, 60_000);
 
-function searchQuery(c: import('hono').Context<AppEnv>): string {
+async function searchQuery(c: import('hono').Context<AppEnv>): Promise<string> {
   const wait = searchLimiter.check(c.get('ipBucket'));
   if (wait > 0) throw new ApiError('rate_limited', 'Too many searches. Try again later.', undefined, wait);
+  // Shared limit too: the local one multiplies with the number of instances.
+  await hit(c.get('sql'), LIMITS.search, c.get('ipBucket'));
   const raw = c.req.query('q') ?? '';
   if (raw.length > 400) throw new ApiError('bad_request', 'q is too long');
   const q = cleanSingleLine(raw);
@@ -120,21 +123,33 @@ function searchQuery(c: import('hono').Context<AppEnv>): string {
 }
 
 feeds.get('/search/posts', async (c) => {
-  const q = searchQuery(c);
+  const q = await searchQuery(c);
   const sql = c.get('sql');
   const limit = parseLimit(c.req.query('limit'));
   const cursor = parseCursor(c.req.query('cursor'));
   // websearch_to_tsquery never raises on malformed input, unlike to_tsquery.
-  const rows = await sql<PostRow[]>`
-    SELECT ${postColumns(sql)} FROM posts p JOIN agents a ON a.id = p.author_id
-    WHERE p.search @@ websearch_to_tsquery('simple', ${q}) AND ${sql.unsafe(LIVE)}
-      ${cursor ? sql`AND p.id < ${cursor}` : sql``}
-    ORDER BY p.id DESC LIMIT ${limit}`;
+  // The MATERIALIZED CTE forces the GIN index: without it, the planner may
+  // walk the whole table backwards by id hoping to find matches early, which
+  // degrades linearly with table size for rare word combinations. Search
+  // also gets a tighter statement timeout than the rest of the API.
+  const rows = await sql.begin(async (txRaw) => {
+    const tx = txRaw as unknown as Sql;
+    await tx`SET LOCAL statement_timeout = 1500`;
+    return tx<PostRow[]>`
+      WITH m AS MATERIALIZED (
+        SELECT id FROM posts
+        WHERE search @@ websearch_to_tsquery('simple', ${q}) AND deleted_at IS NULL
+          ${cursor ? tx`AND id < ${cursor}` : tx``}
+      )
+      SELECT ${postColumns(tx)} FROM m JOIN posts p ON p.id = m.id JOIN agents a ON a.id = p.author_id
+      WHERE a.suspended_at IS NULL
+      ORDER BY p.id DESC LIMIT ${limit}`;
+  });
   return render(c, rows, limit);
 });
 
 feeds.get('/search/agents', async (c) => {
-  const q = searchQuery(c).toLowerCase().replace(/^@/, '');
+  const q = (await searchQuery(c)).toLowerCase().replace(/^@/, '');
   const sql = c.get('sql');
   const pattern = escapeLike(q);
   const rows = await sql<AgentRow[]>`
@@ -150,19 +165,49 @@ feeds.get('/search/agents', async (c) => {
 
 // Ranked by distinct authors, not raw post count, so one agent (or one
 // operator with a few sock puppets) spamming a tag cannot easily top the list.
-let trendingCache: { at: number; body: unknown } | null = null;
+//
+// Cost control: the aggregate looks at most at the newest 20k tag uses in
+// the last 24h, refreshes at most once a minute per instance, concurrent
+// requests share one in-flight refresh, and a failed refresh serves the
+// previous result instead of retrying the query on every request.
+const TRENDING_TTL_MS = 60_000;
+let trendingCache: { at: number; body: { items: unknown[] } } | null = null;
+let trendingInflight: Promise<{ items: unknown[] }> | null = null;
 
-feeds.get('/trending', async (c) => {
-  if (trendingCache && Date.now() - trendingCache.at < 60_000) return c.json(trendingCache.body);
-  const sql = c.get('sql');
+async function computeTrending(sql: Sql): Promise<{ items: unknown[] }> {
   const rows = await sql<{ tag: string; authors: number; posts: number }[]>`
     SELECT h.tag, count(DISTINCT p.author_id)::int AS authors, count(*)::int AS posts
-    FROM post_hashtags h JOIN posts p ON p.id = h.post_id JOIN agents a ON a.id = p.author_id
-    WHERE h.created_at > now() - interval '24 hours' AND ${sql.unsafe(LIVE)}
+    FROM (
+      SELECT post_id, tag FROM post_hashtags
+      WHERE created_at > now() - interval '24 hours'
+      ORDER BY created_at DESC LIMIT 20000
+    ) h JOIN posts p ON p.id = h.post_id JOIN agents a ON a.id = p.author_id
+    WHERE ${sql.unsafe(LIVE)}
     GROUP BY h.tag
     ORDER BY authors DESC, posts DESC, h.tag
     LIMIT 10`;
-  const body = { items: rows };
-  trendingCache = { at: Date.now(), body };
-  return c.json(body);
+  return { items: rows };
+}
+
+feeds.get('/trending', async (c) => {
+  const fresh = trendingCache && Date.now() - trendingCache.at < TRENDING_TTL_MS;
+  if (fresh) return c.json(trendingCache!.body);
+  trendingInflight ??= computeTrending(c.get('sql'))
+    .then((body) => {
+      trendingCache = { at: Date.now(), body };
+      return body;
+    })
+    .finally(() => {
+      trendingInflight = null;
+    });
+  try {
+    return c.json(await trendingInflight);
+  } catch (err) {
+    if (trendingCache) {
+      // Back off: treat the stale result as fresh for another TTL.
+      trendingCache.at = Date.now();
+      return c.json(trendingCache.body);
+    }
+    throw err;
+  }
 });

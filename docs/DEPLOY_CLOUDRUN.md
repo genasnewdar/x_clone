@@ -80,13 +80,27 @@ openssl rand -base64 36 | tr -d '\n' | gcloud secrets versions add agentx-admin-
 deploy/cloudrun/deploy.sh deploy     # new revision picks up :latest
 ```
 
-### 5. Database connections: the classic way to break Cloud Run
+### 5. Database privileges: one manual step
+
+Cloud SQL makes every user created with `gcloud sql users create` a member of `cloudsqlsuperuser`. That role can create databases and roles and read other databases, which is far more than the app needs. On the VM, the app role is `NOSUPERUSER` from the start (`deploy/vm/initdb/01-app-role.sh`). On Cloud SQL you have to take the extra power away yourself.
+
+In the console, open **SQL → agentx-pg → Cloud SQL Studio**, log in as `postgres` (set its password under **Users** first), and run:
+
+```sql
+ALTER DATABASE agentx OWNER TO agentx_app;    -- the app owns its own DB, so it can migrate it
+REVOKE cloudsqlsuperuser FROM agentx_app;     -- ...and nothing else
+ALTER ROLE agentx_app NOCREATEDB NOCREATEROLE;
+```
+
+To check it worked, run `SELECT rolname FROM pg_roles WHERE pg_has_role('agentx_app', oid, 'member');`. It should return only `agentx_app`.
+
+### 6. Database connections: the classic way to break Cloud Run
 
 Each instance opens up to `DB_POOL_SIZE` connections, and `db-f1-micro` allows about 25. With `MAX_INSTANCES=4` and `DB_POOL_SIZE=5`, the most you can open is 4 × 5 = 20.
 
 If you raise max-instances without doing that math, a traffic spike scales out until Postgres refuses connections, and *every* instance starts failing. That's a self-inflicted outage.
 
-### 6. Cost is the DoS surface
+### 7. Cost is the DoS surface
 
 On the VM, a flood makes the site slow. On Cloud Run, a flood makes it **scale**, and you pay. These settings are the brakes:
 
@@ -99,7 +113,7 @@ On the VM, a flood makes the site slow. On Cloud Run, a flood makes it **scale**
 
 Also set a **budget alert**: Billing → Budgets & alerts → 50/90/100% notifications on the JASE project.
 
-### 7. Optional: Cloud Armor
+### 8. Optional: Cloud Armor
 
 Put an external HTTPS Application Load Balancer with a serverless NEG in front, and attach a Cloud Armor policy (for example, rate-based ban: 300 req/min per IP). Set `--ingress=internal-and-cloud-load-balancing` so the `run.app` URL can't bypass it, and `TRUST_PROXY_HOPS=2`.
 

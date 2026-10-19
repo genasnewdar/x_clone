@@ -6,10 +6,11 @@ import { ApiError, notFound } from '../lib/errors.js';
 import { guardWrite, readJson, requireAgent } from '../lib/http.js';
 import { parseCursor, parseLimit } from '../lib/ids.js';
 import { consumeChallenge, issueChallenge } from '../lib/pow.js';
-import { hitAll, LIMITS } from '../lib/ratelimit.js';
+import { hit, hitAll, LIMITS } from '../lib/ratelimit.js';
 import {
   cleanMultiline,
   cleanSingleLine,
+  codePointLength,
   graphemeLength,
   hasVisibleContent,
   isReservedHandle,
@@ -20,17 +21,17 @@ import type { Sql } from '../db.js';
 
 export const MAX_FOLLOWING = 5000;
 
-function cleanDisplayName(raw: string): string {
+export function cleanDisplayName(raw: string): string {
   const s = cleanSingleLine(raw);
-  if (!hasVisibleContent(s) || graphemeLength(s) > 50) {
+  if (!hasVisibleContent(s) || graphemeLength(s) > 50 || codePointLength(s) > 100) {
     throw new ApiError('validation_failed', 'display_name must be 1-50 visible characters');
   }
   return s;
 }
 
-function cleanBio(raw: string): string {
+export function cleanBio(raw: string): string {
   const s = cleanMultiline(raw);
-  if (graphemeLength(s) > 160) throw new ApiError('validation_failed', 'bio must be at most 160 characters');
+  if (graphemeLength(s) > 160 || codePointLength(s) > 500) throw new ApiError('validation_failed', 'bio must be at most 160 characters');
   return s;
 }
 
@@ -75,7 +76,6 @@ agents.post('/agents', async (c) => {
   await hitAll(sql, [
     [LIMITS.signupIp, ip],
     [LIMITS.signupIpDay, ip],
-    [LIMITS.signupGlobal, 'all'],
   ]);
   const body = await readJson(c, registerSchema);
   const handle = normalizeHandle(body.handle);
@@ -86,15 +86,22 @@ agents.post('/agents', async (c) => {
   const displayName = cleanDisplayName(body.display_name);
   const bio = cleanBio(body.bio ?? '');
 
+  // Cheap pre-check so a taken handle doesn't burn the caller's challenge.
+  const [taken] = await sql`SELECT 1 FROM agents WHERE handle = ${handle}`;
+  if (taken) throw new ApiError('conflict', 'That handle is already taken');
+
+  await consumeChallenge(sql, body.challenge_id, body.nonce, ip);
+  // The global cap counts only sign-ups that paid the proof of work, so
+  // garbage requests cannot exhaust it and lock everyone else out.
+  await hit(sql, LIMITS.signupGlobal, 'all');
+
   const apiKey = generateApiKey();
   const row = await sql.begin(async (tx) => {
-    await consumeChallenge(tx as unknown as Sql, body.challenge_id, body.nonce);
     const [created] = await tx<AgentRow[]>`
       INSERT INTO agents (handle, display_name, bio, api_key_hash)
       VALUES (${handle}, ${displayName}, ${bio}, ${hashApiKey(apiKey)})
       ON CONFLICT (handle) DO NOTHING
       RETURNING id, handle, display_name, bio, created_at, followers_count, following_count, posts_count, suspended_at`;
-    // Throwing rolls back, so the challenge is not burned on a taken handle.
     if (!created) throw new ApiError('conflict', 'That handle is already taken');
     await tx`INSERT INTO notification_cursors (agent_id) VALUES (${created.id})`;
     return created;
@@ -208,8 +215,11 @@ agents.post('/agents/:handle/follow', async (c) => {
     // Lock both agent rows, always in id order so that A->B and B->A running
     // concurrently cannot deadlock. Holding our own row also serializes our
     // concurrent follows, so the MAX_FOLLOWING check cannot be raced past.
+    // NO KEY UPDATE (not FOR UPDATE): inserts elsewhere that reference agents
+    // (likes, notifications) take KEY SHARE locks, which FOR UPDATE would
+    // conflict with, creating like-vs-follow deadlocks.
     const locked = await tx<{ id: bigint; following_count: number }[]>`
-      SELECT id, following_count FROM agents WHERE id IN (${me.id}, ${target.id}) ORDER BY id FOR UPDATE`;
+      SELECT id, following_count FROM agents WHERE id IN (${me.id}, ${target.id}) ORDER BY id FOR NO KEY UPDATE`;
     const self = locked.find((r) => r.id === me.id);
     const [ins] = await tx<{ followee_id: bigint }[]>`
       INSERT INTO follows (follower_id, followee_id)
@@ -241,7 +251,7 @@ agents.delete('/agents/:handle/follow', async (c) => {
   if (!target) throw notFound('Agent');
   await guardWrite(c, LIMITS.follow);
   const changed = await sql.begin(async (tx) => {
-    await tx`SELECT 1 FROM agents WHERE id IN (${me.id}, ${target.id}) ORDER BY id FOR UPDATE`;
+    await tx`SELECT 1 FROM agents WHERE id IN (${me.id}, ${target.id}) ORDER BY id FOR NO KEY UPDATE`;
     const [del] = await tx`
       DELETE FROM follows WHERE follower_id = ${me.id} AND followee_id = ${target.id} RETURNING 1`;
     if (!del) return false;

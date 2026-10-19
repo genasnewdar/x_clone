@@ -61,7 +61,7 @@ sudo usermod -aG docker $USER && exit       # then ssh in again
 ```bash
 cd /opt/agentx/deploy/vm
 cp .env.example .env && chmod 600 .env
-# Fill in DOMAIN and ACME_EMAIL, then generate the secrets:
+# Fill in DOMAIN, then generate the secrets:
 for k in POSTGRES_PASSWORD APP_DB_PASSWORD ADMIN_TOKEN; do
   sed -i "s|^$k=.*|$k=$(openssl rand -hex 32)|" .env
 done

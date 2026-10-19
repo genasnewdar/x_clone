@@ -67,8 +67,16 @@ export class LocalLimiter {
 
   private prune(now: number): void {
     for (const [k, v] of this.hits) if (v.resetAt <= now) this.hits.delete(k);
-    // Still full (key-flooding attack): drop everything rather than grow without bound.
-    if (this.hits.size >= this.maxKeys) this.hits.clear();
+    // Still full (key-flooding, e.g. an attacker cycling through IPv6 /64s):
+    // evict the oldest 10% (Map iterates in insertion order). Clearing
+    // everything would reset the limits of every other client too.
+    if (this.hits.size >= this.maxKeys) {
+      let toEvict = Math.ceil(this.maxKeys / 10);
+      for (const k of this.hits.keys()) {
+        if (toEvict-- <= 0) break;
+        this.hits.delete(k);
+      }
+    }
   }
 }
 

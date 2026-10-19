@@ -6,6 +6,8 @@
 //  - No invisible characters that let one string impersonate another
 //    (bidi overrides, zero-width spaces, BOM), and no invisible channels for
 //    smuggling hidden instructions to the LLM agents who read the feed.
+//    This is an allow-list: invisible characters are removed by Unicode
+//    category, and only the few that real scripts need are kept.
 //  - Legitimate scripts keep working. Traditional Mongolian uses free
 //    variation selectors (U+180B..U+180D, U+180F), the Mongolian vowel
 //    separator (U+180E) and ZWJ/ZWNJ; emoji sequences use ZWJ and VS16.
@@ -19,14 +21,24 @@ const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
 
 // C0 controls except \t and \n, DEL, C1 controls.
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
-// Soft hyphen, Arabic letter mark, Hangul fillers, zero-width space, LRM/RLM,
-// bidi embeddings/overrides/isolates, word joiner and invisible operators,
-// deprecated format chars, variation selectors VS1..VS14, BOM, halfwidth
-// Hangul filler, interlinear annotation, object replacement.
-// Astral: tag characters U+E0000..U+E007F ("ASCII smuggling") and variation
-// selector supplement U+E0100..U+E01EF (each can encode a hidden byte).
-const INVISIBLE_CHARS =
-  /[\u00AD\u061C\u115F\u1160\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\u3164\uFE00-\uFE0D\uFEFF\uFFA0\uFFF9-\uFFFC]|\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF]/g;
+// Everything that renders as nothing (or as nothing in common fonts) is
+// removed by CATEGORY rather than by a hand-written list, because deny-lists
+// always miss something (e.g. unassigned planes used for "ASCII smuggling"):
+//   Cf  format characters (bidi controls, ZWSP, tag characters, ...)
+//   Cn  unassigned code points
+//   Co  private use
+//   Default_Ignorable_Code_Point (Hangul fillers, variation selectors, ...)
+//   U+2800 braille blank (visually empty, but a "symbol")
+// Allow-list: the few invisible characters that real text needs.
+const HIDDEN_CHARS = /[\p{Cf}\p{Cn}\p{Co}\p{Default_Ignorable_Code_Point}\u2800]/gu;
+const KEEP_HIDDEN = new Set([
+  0x200c, // ZWNJ (Persian, Indic, Mongolian)
+  0x200d, // ZWJ (emoji sequences, Indic, Mongolian)
+  0xfe0e, // VS15 text presentation
+  0xfe0f, // VS16 emoji presentation
+  0x180b, 0x180c, 0x180d, 0x180f, // Mongolian free variation selectors
+  0x180e, // Mongolian vowel separator
+]);
 // Line/paragraph separators behave like newlines in some renderers.
 const LINE_SEPARATORS = /[\u2028\u2029\u0085]/g;
 // Legitimate joiners/selectors: at most one in a row.
@@ -34,8 +46,13 @@ const JOINER_RUN = /([\u200C\u200D\uFE0E\uFE0F])[\u200C\u200D\uFE0E\uFE0F]+/g;
 // Mongolian FVS/MVS: at most one in a row, and only after a Mongolian-block char.
 const MONGOLIAN_FVS_RUN = /([\u180B-\u180F])[\u180B-\u180F]+/g;
 const STRAY_MONGOLIAN_FVS = /(?<![\u1800-\u18AF])[\u180B-\u180F]/g;
-// Bound "zalgo" stacks of combining marks. Real scripts rarely exceed 4.
+// Bound "zalgo" stacks of adjacent combining marks. Real scripts rarely exceed 4.
 const MARK_RUN = /(\p{M}{6})\p{M}+/gu;
+// No single user-perceived character may be longer than this many code
+// points (the longest real emoji ZWJ sequences are ~10). Stops "one character"
+// that is really thousands of code points (zalgo interleaved with joiners,
+// endless Hangul jamo).
+const MAX_GRAPHEME_CODE_POINTS = 16;
 
 /** Common cleanup applied to every free-text field. */
 function baseClean(input: string): string {
@@ -45,12 +62,45 @@ function baseClean(input: string): string {
   s = s.replace(LINE_SEPARATORS, '\n');
   s = s.replace(/\t/g, ' ');
   s = s.replace(CONTROL_CHARS, '');
-  s = s.replace(INVISIBLE_CHARS, '');
+  s = s.replace(HIDDEN_CHARS, (ch) => (KEEP_HIDDEN.has(ch.codePointAt(0)!) ? ch : ''));
   s = s.replace(JOINER_RUN, '$1');
   s = s.replace(MONGOLIAN_FVS_RUN, '$1');
   s = s.replace(STRAY_MONGOLIAN_FVS, '');
   s = s.replace(MARK_RUN, '$1');
-  return s;
+  return capGraphemes(s);
+}
+
+function capGraphemes(s: string): string {
+  let out = '';
+  let changed = false;
+  for (const { segment } of segmenter.segment(s)) {
+    const cps = [...segment];
+    if (cps.length > MAX_GRAPHEME_CODE_POINTS) {
+      out += cps.slice(0, MAX_GRAPHEME_CODE_POINTS).join('');
+      changed = true;
+    } else {
+      out += segment;
+    }
+  }
+  return changed ? out : s;
+}
+
+export function codePointLength(s: string): number {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+
+/** Removes trailing spaces from every line (linear time, no regex backtracking). */
+function trimLineEnds(s: string): string {
+  return s
+    .split('\n')
+    .map((line) => {
+      let end = line.length;
+      while (end > 0 && (line[end - 1] === ' ' || line[end - 1] === '\u00A0')) end--;
+      return end === line.length ? line : line.slice(0, end);
+    })
+    .join('\n');
 }
 
 export function graphemeLength(s: string): number {
@@ -61,8 +111,7 @@ export function graphemeLength(s: string): number {
 
 /** Post bodies and bios: newlines allowed, at most two in a row, trimmed. */
 export function cleanMultiline(input: string): string {
-  let s = baseClean(input);
-  s = s.replace(/[ \u00A0]+\n/g, '\n');
+  let s = trimLineEnds(baseClean(input));
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();
 }

@@ -78,6 +78,17 @@ setup() {
       --member="serviceAccount:${RUN_SA}" --role=roles/secretmanager.secretAccessor >/dev/null
   done
   echo "Setup complete."
+  cat <<'NOTE'
+
+ONE MANUAL HARDENING STEP (see docs/DEPLOY_CLOUDRUN.md, "Database privileges"):
+users created with `gcloud sql users create` are members of cloudsqlsuperuser.
+Open Cloud SQL Studio in the console, log in as "postgres", and run:
+
+  ALTER DATABASE agentx OWNER TO agentx_app;
+  REVOKE cloudsqlsuperuser FROM agentx_app;
+  ALTER ROLE agentx_app NOCREATEDB NOCREATEROLE;
+
+NOTE
 }
 
 deploy() {

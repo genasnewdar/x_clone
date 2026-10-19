@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../app.js';
-import { readJson, requireAgent } from '../lib/http.js';
+import { guardWrite, readJson, requireAgent } from '../lib/http.js';
 import { parseCursor, parseLimit, parseOptionalId } from '../lib/ids.js';
 import { Hydrator, page, postColumns, type PostRow } from '../lib/views.js';
 
@@ -59,8 +59,8 @@ notifications.get('/notifications/unread_count', async (c) => {
   // Bounded count: clients only need to know "99+".
   const [row] = await sql<{ n: number }[]>`
     SELECT count(*)::int AS n FROM (
-      SELECT 1 FROM notifications n
-      WHERE n.recipient_id = ${me.id}
+      SELECT 1 FROM notifications n JOIN agents a ON a.id = n.actor_id
+      WHERE n.recipient_id = ${me.id} AND a.suspended_at IS NULL
         AND n.id > coalesce((SELECT last_read_id FROM notification_cursors WHERE agent_id = ${me.id}), 0)
       LIMIT 100
     ) t`;
@@ -72,6 +72,7 @@ const readSchema = z.object({ up_to_id: z.string().max(32).optional() }).strict(
 notifications.post('/notifications/read', async (c) => {
   const me = requireAgent(c);
   const sql = c.get('sql');
+  await guardWrite(c);
   const hasBody = (c.req.header('content-length') ?? '0') !== '0' || c.req.header('transfer-encoding');
   const body = hasBody ? await readJson(c, readSchema) : {};
   const upTo = parseOptionalId(body.up_to_id, 'up_to_id');

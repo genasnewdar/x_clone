@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { solve } from '../src/lib/pow.js';
 import { ADMIN_TOKEN, makeApp, post, randomIp, register, req, uniqueHandle, type App, type TestAgent } from './helpers.js';
 import type { Sql } from '../src/db.js';
@@ -133,7 +133,7 @@ describe('sign-up', () => {
 describe('authentication', () => {
   it('rejects malformed, unknown and wrong-scheme credentials (never anonymous fallback)', async () => {
     const a = await register(app);
-    for (const header of ['Bearer', 'Bearer nope', `Basic ${a.key}`, `Bearer ${a.key}x`, `Bearer ${a.key.slice(0, -1)}A`]) {
+    for (const header of ['Bearer', 'Bearer nope', `Basic ${a.key}`, `Bearer ${a.key}x`, `Bearer ${a.key.slice(0, -1)}${a.key.endsWith('A') ? 'B' : 'A'}`]) {
       const r = await req(app, 'GET', 'timeline/global', { headers: { authorization: header } });
       expect(r.status).toBe(401);
     }
@@ -156,8 +156,9 @@ describe('authentication', () => {
 });
 
 describe('posting', () => {
+  // Fresh agent per test: invalid posts count against the (new-agent) post limit.
   let a: TestAgent;
-  beforeAll(async () => {
+  beforeEach(async () => {
     a = await register(app);
   });
 
@@ -170,8 +171,9 @@ describe('posting', () => {
   });
 
   it('enforces 280 graphemes, not bytes or code units', async () => {
-    const emoji = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}';
-    expect((await post(app, a, emoji.repeat(280))).status).toBe(201);
+    const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}';
+    expect((await post(app, a, '\u{1F600}'.repeat(280))).status).toBe(201);
+    expect((await post(app, a, family.repeat(150))).status).toBe(201); // 150 graphemes, 750 code points
     expect((await post(app, a, 'x'.repeat(281))).status).toBe(422);
     expect((await post(app, a, 'y'.repeat(4999))).status).toBe(422);
     expect((await post(app, a, 'y'.repeat(5001))).status).toBe(422);
@@ -229,8 +231,9 @@ describe('posting', () => {
       const g = await req(app, 'GET', `posts/${encodeURIComponent(id)}`);
       expect(g.status).toBe(404);
     }
-    expect((await post(app, a, 'num id', { reply_to_id: 5 })).status).toBe(422);
-    expect((await post(app, a, 'arr id', { reply_to_id: ['1'] })).status).toBe(422);
+    const b = await register(app);
+    expect((await post(app, b, 'num id', { reply_to_id: 5 })).status).toBe(422);
+    expect((await post(app, b, 'arr id', { reply_to_id: ['1'] })).status).toBe(422);
   });
 
   it('cannot reply to or quote a deleted post', async () => {

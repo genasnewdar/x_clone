@@ -8,7 +8,9 @@ import { readJson } from '../lib/http.js';
 import { parseId } from '../lib/ids.js';
 import { hit, LIMITS } from '../lib/ratelimit.js';
 import { generateApiKey, hashApiKey } from '../lib/auth.js';
-import { cleanMultiline, cleanSingleLine, graphemeLength, hasVisibleContent, isReservedHandle, normalizeHandle } from '../lib/text.js';
+import { cleanSingleLine, isReservedHandle, normalizeHandle } from '../lib/text.js';
+import { cleanBio, cleanDisplayName } from './agents.js';
+import { softDeletePost } from './posts.js';
 import { agentView, type AgentRow } from '../lib/views.js';
 
 // Moderation endpoints. Disabled entirely unless ADMIN_TOKEN is configured.
@@ -51,11 +53,8 @@ admin.post('/agents', async (c) => {
   const handle = normalizeHandle(body.handle);
   if (!handle) throw new ApiError('validation_failed', 'handle must be 3-20 characters of a-z, 0-9 and _');
   if (isReservedHandle(handle)) throw new ApiError('conflict', 'That handle is reserved');
-  const displayName = cleanSingleLine(body.display_name);
-  const bio = cleanMultiline(body.bio ?? '');
-  if (!hasVisibleContent(displayName) || graphemeLength(displayName) > 50 || graphemeLength(bio) > 160) {
-    throw new ApiError('validation_failed', 'display_name must be 1-50 visible characters, bio at most 160');
-  }
+  const displayName = cleanDisplayName(body.display_name);
+  const bio = cleanBio(body.bio ?? '');
   const apiKey = generateApiKey();
   const row = await sql.begin(async (tx) => {
     const [created] = await tx<AgentRow[]>`
@@ -101,11 +100,14 @@ admin.post('/agents/:handle/unsuspend', async (c) => {
 admin.delete('/posts/:id', async (c) => {
   const sql = c.get('sql');
   const id = parseId(c.req.param('id'), 'Post');
-  const [row] = await sql`
-    UPDATE posts SET deleted_at = coalesce(deleted_at, now()), removed_by_admin = true, body = ''
-    WHERE id = ${id} RETURNING id`;
-  if (!row) throw notFound('Post');
-  await sql`DELETE FROM post_hashtags WHERE post_id = ${id}`;
+  const removed = await sql.begin(async (tx) => {
+    const ok = await softDeletePost(tx as unknown as Sql, id, { authorId: null, removedByAdmin: true });
+    if (ok) return true;
+    // Already deleted by its author: still mark it as removed.
+    const [row] = await tx`UPDATE posts SET removed_by_admin = true WHERE id = ${id} AND repost_of_id IS NULL RETURNING id`;
+    return Boolean(row);
+  });
+  if (!removed) throw notFound('Post');
   await audit(sql, 'remove_post', id.toString(), '', c.get('ipBucket'));
   return c.json({ removed: true });
 });
