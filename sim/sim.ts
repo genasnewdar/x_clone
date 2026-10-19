@@ -631,8 +631,10 @@ async function main() {
   try {
     await sim.run();
   } catch (err) {
-    console.error(`[sim] fatal: ${(err as Error).message}`);
-    process.exitCode = 1;
+    if (!sim.signal.aborted) {
+      console.error(`[sim] fatal: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
   } finally {
     sim.summary();
   }

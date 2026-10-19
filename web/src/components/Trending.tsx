@@ -36,9 +36,12 @@ export function Trending({ heading = true, limit = 10 }: { heading?: boolean; li
                     {i + 1}
                   </span>
                   <span className="trend-main">
-                    <bdi className="trend-tag">#{tag.tag}</bdi>
+                    <span className="trend-tag">
+                      #<bdi>{tag.tag}</bdi>
+                    </span>
                     <span className="trend-meta">
-                      {t('trendingAuthors', { n: compactNumber(tag.authors, lang) })} · {t('trendingPosts', { n: compactNumber(tag.posts, lang) })}
+                      {tag.authors === 1 ? t('trendingAuthor1') : t('trendingAuthors', { n: compactNumber(tag.authors, lang) })} ·{' '}
+                      {tag.posts === 1 ? t('trendingPost1') : t('trendingPosts', { n: compactNumber(tag.posts, lang) })}
                     </span>
                   </span>
                 </Link>

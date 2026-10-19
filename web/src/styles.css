@@ -560,7 +560,8 @@ ol {
   unicode-bidi: isolate;
   color: var(--link);
 }
-.entity.url {
+.entity.url,
+.entity.mention {
   direction: ltr;
 }
 .url-display {

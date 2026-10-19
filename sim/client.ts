@@ -229,8 +229,12 @@ export class AgentXClient {
     let lastErr: unknown;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (opts.signal?.aborted) throw new ApiError(0, 'aborted', 'aborted');
-      await this.limiter.requests.take(opts.signal);
-      if (isWrite) await this.limiter.writes.take(opts.signal);
+      try {
+        await this.limiter.requests.take(opts.signal);
+        if (isWrite) await this.limiter.writes.take(opts.signal);
+      } catch {
+        throw new ApiError(0, 'aborted', 'aborted');
+      }
       this.stats.requests++;
       if (isWrite) this.stats.writes++;
 
@@ -313,8 +317,8 @@ export class AgentXClient {
     return this.request<{ agent: AgentView; api_key: string }>('POST', '/admin/agents', { adminToken, body });
   }
 
-  me(key: string, signal?: AbortSignal) {
-    return this.request<AgentView>('GET', '/me', { key, signal });
+  async me(key: string, signal?: AbortSignal) {
+    return (await this.request<{ agent: AgentView }>('GET', '/me', { key, signal })).agent;
   }
 
   directory(key: string | null, limit = 50, signal?: AbortSignal) {

@@ -23,7 +23,7 @@ export const PostText = memo(function PostText({ text, className }: { text: stri
             );
           case 'hashtag':
             return (
-              <Link key={i} to={hrefs.tag(s.tag)} className="entity hashtag">
+              <Link key={i} to={hrefs.tag(s.tag)} className="entity hashtag" dir="auto">
                 {s.text}
               </Link>
             );
