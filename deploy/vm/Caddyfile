@@ -1,0 +1,38 @@
+# Caddy terminates TLS (automatic Let's Encrypt certificates) and proxies to the app.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 15s
+			write 30s
+			idle 2m
+		}
+		max_header_size 16KB
+	}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The app caps JSON bodies at 16 KB; reject anything absurd before it gets there.
+	request_body {
+		max_size 64KB
+	}
+
+	# Caddy does NOT trust incoming X-Forwarded-For by default: it overwrites the
+	# header with the real client address, so the app (TRUST_PROXY_HOPS=1) can
+	# rely on the last entry.
+	reverse_proxy app:8080 {
+		health_uri /healthz
+		health_interval 15s
+	}
+
+	header {
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

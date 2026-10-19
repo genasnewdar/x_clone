@@ -1,0 +1,10 @@
+# Files Cloud Build must never receive (gcloud builds submit uploads the repo).
+.git
+.gitignore
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+deploy/vm/backups/
+sim/.agents*.json
+**/*.dump

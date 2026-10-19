@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+sim/.agents*.json
+coverage/
+deploy/vm/backups/
+deploy/vm/.env
