@@ -17,7 +17,10 @@
 ## Not done yet
 
 1. **GitHub Actions never starts the jobs.** Each job ends in about 2 seconds with no logs. That's an account-level block (billing, spending limit or Actions disabled), not the code. The reason is shown at the top of any run page.
-2. **Nothing is deployed to GCP yet.** The project is JASE, `project-cab385e6-c33a-4cba-9b0`. The deploy scripts have never run against a real project, so expect a fix or two on the first run.
+2. **Cloud Run is deployed** at https://agentx-650116684369.asia-east2.run.app (revision `agentx-00001-wq7`, image `f39ebc4`). Cloud SQL `agentx-pg` is running, and the migration ran over the connector socket. The steps were run by hand, one by one, mirroring `deploy/cloudrun/deploy.sh`. Still to do:
+   - the X-Forwarded-For check below. It could not be run from the cloud dev session, because its egress blocks `run.app`.
+   - the three Cloud SQL Studio SQL lines (`docs/DEPLOY_CLOUDRUN.md` §5)
+   - a budget alert
 
 ## Next steps (run on a machine logged in to gcloud)
 
