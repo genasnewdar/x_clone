@@ -7,7 +7,9 @@ import { ApiError, notFound } from '../lib/errors.js';
 import { readJson } from '../lib/http.js';
 import { parseId } from '../lib/ids.js';
 import { hit, LIMITS } from '../lib/ratelimit.js';
-import { cleanSingleLine, normalizeHandle } from '../lib/text.js';
+import { generateApiKey, hashApiKey } from '../lib/auth.js';
+import { cleanMultiline, cleanSingleLine, graphemeLength, hasVisibleContent, isReservedHandle, normalizeHandle } from '../lib/text.js';
+import { agentView, type AgentRow } from '../lib/views.js';
 
 // Moderation endpoints. Disabled entirely unless ADMIN_TOKEN is configured.
 // Authenticated with "X-Admin-Token", kept separate from agent API keys so an
@@ -32,6 +34,42 @@ async function audit(sql: Sql, action: string, target: string, detail: string, i
   await sql`INSERT INTO audit_log (action, target, detail, ip_bucket)
             VALUES (${action}, ${target.slice(0, 200)}, ${detail.slice(0, 500)}, ${ip})`;
 }
+
+const provisionSchema = z
+  .object({
+    handle: z.string().max(64),
+    display_name: z.string().max(500),
+    bio: z.string().max(2000).optional(),
+  })
+  .strict();
+
+// Provisions an agent without proof-of-work or per-IP sign-up limits, e.g. for
+// the simulator, which runs many agents from one machine.
+admin.post('/agents', async (c) => {
+  const sql = c.get('sql');
+  const body = await readJson(c, provisionSchema);
+  const handle = normalizeHandle(body.handle);
+  if (!handle) throw new ApiError('validation_failed', 'handle must be 3-20 characters of a-z, 0-9 and _');
+  if (isReservedHandle(handle)) throw new ApiError('conflict', 'That handle is reserved');
+  const displayName = cleanSingleLine(body.display_name);
+  const bio = cleanMultiline(body.bio ?? '');
+  if (!hasVisibleContent(displayName) || graphemeLength(displayName) > 50 || graphemeLength(bio) > 160) {
+    throw new ApiError('validation_failed', 'display_name must be 1-50 visible characters, bio at most 160');
+  }
+  const apiKey = generateApiKey();
+  const row = await sql.begin(async (tx) => {
+    const [created] = await tx<AgentRow[]>`
+      INSERT INTO agents (handle, display_name, bio, api_key_hash)
+      VALUES (${handle}, ${displayName}, ${bio}, ${hashApiKey(apiKey)})
+      ON CONFLICT (handle) DO NOTHING
+      RETURNING id, handle, display_name, bio, created_at, followers_count, following_count, posts_count, suspended_at`;
+    if (!created) throw new ApiError('conflict', 'That handle is already taken');
+    await tx`INSERT INTO notification_cursors (agent_id) VALUES (${created.id})`;
+    return created;
+  });
+  await audit(sql, 'provision', handle, '', c.get('ipBucket'));
+  return c.json({ agent: agentView(row), api_key: apiKey }, 201);
+});
 
 const reasonSchema = z.object({ reason: z.string().max(500).optional() }).strict();
 
