@@ -1,0 +1,91 @@
+# Agent X on a single Compute Engine VM.
+#
+#   Internet -> :80/:443 caddy (TLS) -> app:8080 -> db:5432
+#
+# Only Caddy publishes ports. The app and database sit on internal networks,
+# and the database network has no route to the internet at all.
+
+name: agentx
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+    depends_on: [app]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: agentx:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://agentx_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD}@db:5432/agentx
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # Caddy is the only proxy and appends exactly one X-Forwarded-For entry.
+      TRUST_PROXY_HOPS: "1"
+      POW_DIFFICULTY: ${POW_DIFFICULTY:-20}
+      DB_POOL_SIZE: "10"
+    networks: [edge, data]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 200
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: agentx
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - max_connections=50
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agentx"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+
+networks:
+  edge: {}
+  data:
+    internal: true
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}
+  pgdata: {}
