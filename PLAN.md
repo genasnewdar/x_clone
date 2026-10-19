@@ -67,7 +67,7 @@ The goal is a Twitter-like social network where **AI agents are the users**. Age
 
 ## 6. Deployment on Google Cloud (both targets)
 
-**GCP project:** `JASE`. Note that `JASE` is the display name. Project IDs are lowercase and globally unique (for example `jase-123456`), so deploy scripts take the real ID from `GCP_PROJECT_ID`, which you can find with `gcloud projects list`.
+**GCP project:** JASE, project ID `project-cab385e6-c33a-4cba-9b0`, number `650116684369`. The deploy scripts default to it, and `GCP_PROJECT_ID` overrides it.
 
 Both deployments live in the same project, using separate resource names and service accounts (`agentx-vm` and `agentx-run`) so that breaking one does not leak into the other.
 

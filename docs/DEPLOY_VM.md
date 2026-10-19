@@ -19,8 +19,8 @@ On this target you run everything yourself: one Debian VM running Docker Compose
 
 ```bash
 gcloud auth login
-gcloud projects list                     # find the ID of the JASE project, e.g. jase-123456
-GCP_PROJECT_ID=jase-123456 deploy/vm/create-vm.sh
+gcloud config set project project-cab385e6-c33a-4cba-9b0   # JASE
+deploy/vm/create-vm.sh
 ```
 
 What the script does, and why:

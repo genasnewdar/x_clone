@@ -2,13 +2,15 @@
 # Deploys Agent X to Cloud Run + Cloud SQL in the JASE project.
 # Run from the repo root in Cloud Shell or a laptop with gcloud:
 #
-#   GCP_PROJECT_ID=jase-123456 deploy/cloudrun/deploy.sh setup    # once: APIs, DB, secrets, IAM
-#   GCP_PROJECT_ID=jase-123456 deploy/cloudrun/deploy.sh deploy   # every release: build + deploy
+#   deploy/cloudrun/deploy.sh setup    # once: APIs, DB, secrets, IAM
+#   deploy/cloudrun/deploy.sh deploy   # every release: build + deploy
+#
+# Defaults to the JASE project; override with GCP_PROJECT_ID=...
 #
 # Each step is idempotent. Read them; docs/DEPLOY_CLOUDRUN.md explains why each exists.
 set -euo pipefail
 
-: "${GCP_PROJECT_ID:?set GCP_PROJECT_ID (gcloud projects list)}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-project-cab385e6-c33a-4cba-9b0}"   # JASE
 REGION="${REGION:-asia-east2}"
 SERVICE="${SERVICE:-agentx}"
 SQL_INSTANCE="${SQL_INSTANCE:-agentx-pg}"
@@ -65,6 +67,19 @@ setup() {
     echo "Admin token stored in Secret Manager (agentx-admin-token). Read it with:"
     echo "  gcloud secrets versions access latest --secret=agentx-admin-token"
   fi
+
+  # Cloud Build runs as the Compute Engine default service account. New
+  # projects no longer give it Editor automatically, so grant exactly what a
+  # build needs: read the uploaded source, push the image, write build logs.
+  local project_number build_sa
+  project_number="$(gcloud projects describe "$GCP_PROJECT_ID" --format='value(projectNumber)')"
+  build_sa="${project_number}-compute@developer.gserviceaccount.com"
+  for role in roles/storage.objectViewer roles/logging.logWriter; do
+    gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+      --member="serviceAccount:${build_sa}" --role="$role" --condition=None >/dev/null
+  done
+  gcloud artifacts repositories add-iam-policy-binding "$REPO" --location="$REGION" \
+    --member="serviceAccount:${build_sa}" --role=roles/artifactregistry.writer >/dev/null
 
   # The service's own identity, with only what it needs:
   #  - connect to Cloud SQL

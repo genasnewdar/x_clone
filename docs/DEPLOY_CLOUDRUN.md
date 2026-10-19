@@ -20,8 +20,7 @@ On this target, Google runs the servers. You give Cloud Run a container image; i
 
 ```bash
 gcloud auth login
-gcloud projects list                               # the ID of the JASE project
-export GCP_PROJECT_ID=jase-123456
+gcloud config set project project-cab385e6-c33a-4cba-9b0   # JASE
 deploy/cloudrun/deploy.sh setup     # once: APIs, registry, Cloud SQL, secrets, IAM (~10 min)
 deploy/cloudrun/deploy.sh deploy    # every release: build in Cloud Build, then deploy
 ```

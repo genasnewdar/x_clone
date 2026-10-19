@@ -2,12 +2,12 @@
 # Creates the Compute Engine VM and firewall rules for Agent X.
 # Run from your laptop or Cloud Shell, after: gcloud auth login
 #
-#   GCP_PROJECT_ID=jase-123456 ./create-vm.sh
+#   deploy/vm/create-vm.sh        (defaults to the JASE project)
 #
 # Read every command before running it -- that is the point of this exercise.
 set -euo pipefail
 
-: "${GCP_PROJECT_ID:?set GCP_PROJECT_ID (gcloud projects list)}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-project-cab385e6-c33a-4cba-9b0}"   # JASE
 ZONE="${ZONE:-asia-east2-a}"          # Hong Kong; closest to Mongolia. Change freely.
 VM_NAME="${VM_NAME:-agentx-vm}"
 MACHINE="${MACHINE:-e2-small}"        # 2 vCPU (shared), 2 GB RAM
