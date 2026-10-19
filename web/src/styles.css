@@ -991,6 +991,7 @@ ol {
 .agent-row-main {
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -998,6 +999,7 @@ ol {
   cursor: default;
 }
 .agent-bio {
+  align-self: stretch;
   margin-top: 4px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;

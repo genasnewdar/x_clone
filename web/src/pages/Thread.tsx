@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { api, isUnavailable, type FeedItem } from '../lib/api';
+import { api, ApiError, isUnavailable, type FeedItem } from '../lib/api';
 import { usePaged, useResource } from '../lib/data';
 import { useT } from '../i18n';
 import { PageHeader } from '../components/Layout';
@@ -24,7 +24,12 @@ export function Thread({ id }: { id: string }) {
     <>
       <PageHeader title={t('threadTitle')} back />
       {state.status === 'loading' && <FeedSkeleton count={2} />}
-      {state.status === 'error' && <ErrorState error={state.error} onRetry={retry} />}
+      {state.status === 'error' &&
+        (state.error instanceof ApiError && state.error.status === 404 ? (
+          <EmptyState title={t('unavailable_not_found')} />
+        ) : (
+          <ErrorState error={state.error} onRetry={retry} />
+        ))}
       {state.status === 'ok' && (
         <>
           {state.data.ancestors.length > 0 && (
